@@ -5,6 +5,12 @@ import json
 import time
 from pathlib import Path
 from requests.exceptions import RequestException
+from datetime import datetime
+import pytz
+from datetime import datetime
+import pytz
+from datetime import datetime
+import pytz
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -14,13 +20,16 @@ st.set_page_config(
 )
 
 # --- Constants ---
-MUST_HAVE = ["2026", "class x", "result"]
+MUST_HAVE = ["2026", "class x", "examination"]
 MUST_NOT = ["xii", "re-evaluation", "compartment", "supplementary"]
 
 # Check both the results portal and the main website
 TARGET_URLS = [
     "https://cbseresults.nic.in/",
-    "https://cbse.nic.in/"
+    "https://cbse.nic.in/",
+    "https://results.cbse.nic.in/2026-2/",
+    "https://results.cbse.nic.in",
+    "https://results.cbse.nic.in/2026-1/",
 ]
 
 # --- Firebase Cloud Messaging Configuration ---
@@ -84,18 +93,23 @@ def load_firebase_config():
 FIREBASE_CONFIG, FCM_VAPID_KEY = load_firebase_config()
 
 # --- Core Logic ---
+from urllib.parse import urljoin
+
+def get_ist_time():
+    """Get current time in IST (Indian Standard Time)"""
+    ist = pytz.timezone('Asia/Kolkata')
+    return datetime.now(ist).strftime('%I:%M:%S %p')
+
 def check_cbse_results() -> dict | str | None:
-    """
-    Scrapes official CBSE portals for Class 10 result links.
-    Returns a dictionary with link info, 'error' on total failure, or None.
-    """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
+        'Cache-Control': 'no-cache'
     }
     
     success_flags = 0
+    # Ensure keywords are lowercase to match the .lower() check
+    KEYWORDS = [k.lower() for k in MUST_HAVE]
+    EXCLUSIONS = [x.lower() for x in MUST_NOT]
     
     for url in TARGET_URLS:
         try:
@@ -104,24 +118,20 @@ def check_cbse_results() -> dict | str | None:
             success_flags += 1
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            links = soup.find_all('a')
-            for link in links:
-                text = link.get_text().strip().lower()
-                if all(k in text for k in MUST_HAVE) and not any(x in text for x in MUST_NOT):
-                    href = link.get('href', '')
-                    # Resolve relative URLs
-                    full_url = href if href.startswith('http') else f"{url.rstrip('/')}/{href.lstrip('/')}"
+            for link in soup.find_all('a', href=True): # Only links with href
+                link_text = link.get_text(separator=" ", strip=True).lower()
+                
+                if all(k in link_text for k in KEYWORDS) and not any(x in link_text for x in EXCLUSIONS):
+                    raw_href = link['href']
+                    # Smart URL joining (handles / and http:// correctly)
+                    full_url = urljoin(url, raw_href)
                     return {"text": link.get_text().strip(), "url": full_url}
         
         except RequestException:
-            # Silently continue to the next URL if one fails
             continue
             
-    # If all URLs resulted in a RequestException, return an error state
-    if success_flags == 0:
-        return "error"
-        
-    return None
+    return "error" if success_flags == 0 else None
+
 
 # --- Firebase Cloud Messaging Helper ---
 def render_fcm_registration_widget(firebase_config: dict, vapid_key: str) -> None:
@@ -145,7 +155,11 @@ def render_fcm_registration_widget(firebase_config: dict, vapid_key: str) -> Non
         const swCode = `importScripts('https://www.gstatic.com/firebasejs/9.22.1/firebase-app-compat.js');
 importScripts('https://www.gstatic.com/firebasejs/9.22.1/firebase-messaging-compat.js');
 
-firebase.initializeApp(@@FIREBASE_CONFIG@@);
+if (!firebase.apps.length) {
+  firebase.initializeApp(@@FIREBASE_CONFIG@@);
+} else {
+  firebase.app();
+}
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage(function(payload) {{
@@ -157,28 +171,46 @@ messaging.onBackgroundMessage(function(payload) {{
   self.registration.showNotification(notificationTitle, notificationOptions);
 }});`;
 
+        const ensureFirebaseInitialized = () => {{
+            if (!firebase.apps.length) {{
+                firebase.initializeApp(firebaseConfig);
+            }}
+        }};
+
         const registerServiceWorker = async () => {{
             if (!('serviceWorker' in navigator)) {{
                 document.getElementById('fcm-status').innerText = 'FCM status: Service Worker not supported in this browser.';
-                return;
+                return null;
             }}
+
             try {{
                 const blob = new Blob([swCode], {{ type: 'application/javascript' }});
                 const swUrl = URL.createObjectURL(blob);
                 const registration = await navigator.serviceWorker.register(swUrl);
                 document.getElementById('fcm-status').innerText = 'FCM status: service worker registered.';
-                await initializeFirebaseMessaging(registration);
+                return registration;
             }} catch (error) {{
                 document.getElementById('fcm-status').innerText = 'FCM status: registration failed.';
                 console.error(error);
+                return null;
             }}
         }};
 
         const initializeFirebaseMessaging = async (registration) => {{
-            firebase.initializeApp(firebaseConfig);
+            ensureFirebaseInitialized();
             const messaging = firebase.messaging();
+            if (Notification.permission === 'denied') {{
+                document.getElementById('fcm-status').innerText = 'FCM status: notifications are blocked. Please allow notifications in your browser settings.';
+                return;
+            }}
             try {{
-                await Notification.requestPermission();
+                if (Notification.permission !== 'granted') {{
+                    await Notification.requestPermission();
+                }}
+                if (Notification.permission !== 'granted') {{
+                    document.getElementById('fcm-status').innerText = 'FCM status: notification permission denied.';
+                    return;
+                }}
                 const token = await messaging.getToken({{ vapidKey: vapidKey, serviceWorkerRegistration: registration }});
                 document.getElementById('fcm-status').innerText = 'FCM status: registered and token acquired.';
                 document.getElementById('fcm-token').innerText = 'Token: ' + token;
@@ -188,11 +220,47 @@ messaging.onBackgroundMessage(function(payload) {{
             }}
         }};
 
-        document.getElementById('register-fcm').addEventListener('click', registerServiceWorker);
+        const autoRegisterFcm = async () => {{
+            if (!('serviceWorker' in navigator)) {{
+                document.getElementById('fcm-status').innerText = 'FCM status: Service Worker not supported in this browser.';
+                return;
+            }}
+
+            try {{
+                const existingRegistration = await navigator.serviceWorker.getRegistration();
+                if (existingRegistration) {{
+                    document.getElementById('fcm-status').innerText = 'FCM status: service worker already registered.';
+                    await initializeFirebaseMessaging(existingRegistration);
+                    return;
+                }}
+
+                if (Notification.permission === 'granted') {{
+                    const registration = await registerServiceWorker();
+                    if (registration) {{
+                        await initializeFirebaseMessaging(registration);
+                    }}
+                    return;
+                }}
+
+                document.getElementById('fcm-status').innerText = 'FCM status: click to register background notifications.';
+            }} catch (error) {{
+                document.getElementById('fcm-status').innerText = 'FCM status: initialization failed.';
+                console.error(error);
+            }}
+        }};
+
+        document.getElementById('register-fcm').addEventListener('click', async () => {{
+            const registration = await registerServiceWorker();
+            if (registration) {{
+                await initializeFirebaseMessaging(registration);
+            }}
+        }});
+
+        window.addEventListener('load', autoRegisterFcm);
         </script>
     """
     html = js_template.replace('@@FIREBASE_CONFIG@@', firebase_config_json).replace('@@VAPID_KEY@@', json.dumps(vapid_key))
-    st.components.v1.html(html, height=260)
+    st.components.v1.html(html, height=320)
 
 # --- User Interface ---
 ADMIN_USERNAME = "What@1313867688"
@@ -235,6 +303,7 @@ if not auth_enabled and st.session_state.show_login:
             st.session_state.show_login = False
             st.rerun()
         else:
+            st.session_state.tracking = True
             st.error("Invalid credentials. Only admin may use this tracker.")
 
 def prompt_login():
@@ -254,15 +323,14 @@ with st.sidebar:
     )
     st.caption("⚠️ Refresh interval defaults to 5 minutes and can be adjusted after login.")
 
-    if auth_enabled:
-        render_fcm_registration_widget(FIREBASE_CONFIG, FCM_VAPID_KEY)
-    else:
-        if st.button("Login to enable notifications", use_container_width=True, on_click=prompt_login):
-            pass
-        st.caption("Click any control to login as admin.")
+    st.divider()
+    st.subheader("🔔 Notifications")
+    st.info("No login required for push. Register once and receive background notifications even when the PWA is closed.")
+    render_fcm_registration_widget(FIREBASE_CONFIG, FCM_VAPID_KEY)
 
     st.divider()
 
+    st.subheader("🎮 Controls")
     if auth_enabled:
         if st.button("🔓 Logout", use_container_width=True):
             st.session_state.authenticated = False
@@ -293,9 +361,9 @@ if st.session_state.tracking:
     
     with status_placeholder.container():
         if result == "error":
-            st.error(f"⚠️ Connection error at {time.strftime('%I:%M:%S %p')}. Retrying next cycle...")
+            st.error(f"⚠️ Connection error at {get_ist_time()}. Retrying next cycle...")
         elif result is None:
-            st.info(f"🔄 Last checked: **{time.strftime('%I:%M:%S %p')}** - No results found yet.")
+            st.info(f"🔄 Last checked: **{get_ist_time()}** - No results found yet.")
             st.progress(0, text=f"Sleeping for {refresh_rate} seconds...")
         else:
             # Result Found!
